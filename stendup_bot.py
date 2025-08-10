@@ -451,6 +451,19 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return S_MENU
 
 
+def team_choice_keyboard(uid: int) -> InlineKeyboardMarkup:
+    conn = db()
+    rows = conn.execute(
+        "SELECT t.id, t.name FROM teams t JOIN team_members m ON m.team_id=t.id WHERE m.tg_id=? ORDER BY t.id",
+        (uid,),
+    ).fetchall()
+    if not rows:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В меню", callback_data="back:menu")]])
+    buttons = [[InlineKeyboardButton(f"{r['name']} (ID {r['id']})", callback_data=f"g:{r['id']}")] for r in rows]
+    buttons.append([InlineKeyboardButton("🏠 В меню", callback_data="back:menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
 async def on_menu_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -860,7 +873,7 @@ def build_app() -> Application:
             S_REMOVE_MEMBER_SELECT: [
                 CallbackQueryHandler(on_remove_member, pattern=r"^(rm:|back:group)$")
             ],
-        ],
+        },
         fallbacks=[
             CommandHandler("start", cmd_start),
             CommandHandler("cancel", cmd_cancel),
