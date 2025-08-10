@@ -1,2 +1,2 @@
-aiogram==2.25
-python-dateutil
+python-telegram-bot==21.6
+pytz
