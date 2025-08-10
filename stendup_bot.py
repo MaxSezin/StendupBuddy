@@ -801,7 +801,7 @@ def build_app() -> Application:
             S_SET_TIME_TEAM: [CallbackQueryHandler(on_settime_team_choice)],
             S_SET_TIME_HHMM: [MessageHandler(filters.TEXT & (~filters.COMMAND), on_settime_hhmm)],
             S_SET_TIME_TZ: [
-                CallbackQueryHandler(on_tz_offset_pick, pattern=r"^(tzo:|back:menu)$"),
+                CallbackQueryHandler(on_tz_offset_pick, pattern=r"^tzo:-?\d+$|^back:menu$"),
                 MessageHandler(filters.TEXT & (~filters.COMMAND), on_settime_tz_manual),
             ],
             S_SET_SCHEDULE: [CallbackQueryHandler(on_schedule_pick, pattern=r"^sch:")],
