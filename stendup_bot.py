@@ -1,18 +1,6 @@
 # standupbuddy_bot.py
-# StandupBuddy — стабильная версия с меню, TZ‑пикером и гибким расписанием
+# StandupBuddy — версия с простым выбором часового пояса (UTC±N)
 # python-telegram-bot==21.6, pytz
-#
-# Возможности:
-# — Создание команды, мгновенный показ ID и инвайт‑кода
-# — Вступление по инвайт‑коду
-# — Умное меню (показывает только релевантные кнопки)
-# — Настройка времени, часового пояса (через кнопки) и расписания (ежедневно/будни/выходные/кастом)
-# — Автозапуск дэйликов по расписанию и ручной запуск
-# — Напоминания тем, кто не ответил, и итоговая сводка
-# Надёжность:
-# — /cancel прерывает любой мастер и возвращает в меню
-# — /help краткая справка; /health проверка БД и job_queue
-# — Глобальный обработчик ошибок
 #
 # Запуск:
 #   pip install -r requirements.txt
@@ -51,7 +39,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 REMIND_AFTER_MIN = 10
 SUMMARY_AFTER_MIN = 30
-PAGE_SIZE = 10  # для списка таймзон
+PAGE_SIZE = 10  # not used now, kept for compatibility
 
 # Conversation states
 (
@@ -60,7 +48,7 @@ PAGE_SIZE = 10  # для списка таймзон
     S_JOIN_CODE,
     S_SET_TIME_TEAM,
     S_SET_TIME_HHMM,
-    S_SET_TIME_TZ,
+    S_SET_TIME_TZ,   # here we now show UTC±N buttons
     S_SET_SCHEDULE,
     S_STANDUP_TEAM,
 ) = range(8)
@@ -123,8 +111,6 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_updates_standup ON updates(standup_id);
         """
     )
-    # Мягкая миграция reminder_days к JSON (колонка уже TEXT — ок)
-    # Ничего не делаем здесь, парсер поддерживает CSV и JSON.
     conn.commit()
     conn.close()
 
@@ -140,18 +126,40 @@ def now_utc():
     return datetime.now(timezone.utc)
 
 
-def today_in_tz(tz_name: str):
-    tz = pytz.timezone(tz_name)
+def tz_from_str(tz_str: str):
+    """Возвращает tzinfo из строки. Поддерживает:
+    - 'UTC+3', 'UTC-2', 'UTC+0'
+    - классические зоны pytz типа 'Europe/Moscow' (на всякий случай для обратной совместимости).
+    """
+    if tz_str and tz_str.upper().startswith("UTC"):
+        sign = 1
+        rest = tz_str[3:]
+        if rest.startswith("+"):
+            sign = 1
+            rest = rest[1:]
+        elif rest.startswith("-"):
+            sign = -1
+            rest = rest[1:]
+        try:
+            hours = int(rest)
+            return pytz.FixedOffset(sign * hours * 60)
+        except Exception:
+            pass
+    # fallback
+    try:
+        return pytz.timezone(tz_str)
+    except Exception:
+        return pytz.UTC
+
+
+def today_in_tz(tz_str: str):
+    tz = tz_from_str(tz_str)
     return datetime.now(tz).date()
 
 
 def parse_hhmm(s: str) -> time:
     hh, mm = s.split(":")
     return time(int(hh), int(mm))
-
-
-def time_to_str(t: time) -> str:
-    return f"{t.hour:02d}:{t.minute:02d}"
 
 
 def get_user_name(u: Update):
@@ -163,7 +171,6 @@ def get_user_name(u: Update):
 
 
 def parse_reminder_days(raw: str | None) -> tuple[int, ...]:
-    """Поддерживаем JSON ([0,1,2]) и старый CSV ("0,1,2"). Если пусто — каждый день."""
     if not raw or raw.strip() == "":
         return tuple(range(7))
     try:
@@ -190,7 +197,6 @@ def days_to_label(days: tuple[int, ...]) -> str:
 # ---------- UI ----------
 
 def main_menu(uid: int) -> InlineKeyboardMarkup:
-    """Показываем только релевантные кнопки."""
     conn = db()
     rows = conn.execute(
         "SELECT t.id, t.managers_json FROM teams t JOIN team_members m ON m.team_id=t.id WHERE m.tg_id=?",
@@ -218,34 +224,22 @@ async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str = 
         await update.effective_message.reply_text(text, reply_markup=main_menu(update.effective_user.id))
 
 
-# ---------- TZ PICKER ----------
+# ---------- SIMPLE UTC±N PICKER ----------
 
-def tz_region_keyboard() -> InlineKeyboardMarkup:
-    regions = ["Europe", "America", "Asia", "Africa", "Australia", "Pacific", "Indian", "Atlantic", "UTC"]
-    rows = [[InlineKeyboardButton(r, callback_data=f"tzr:{r}")] for r in regions]
-    rows.append([InlineKeyboardButton("⌨️ Ввести вручную", callback_data="tzman")])
+def tz_offset_keyboard() -> InlineKeyboardMarkup:
+    # диапазон смещений от -12 до +14
+    offsets = list(range(-12, 15))
+    rows = []
+    row = []
+    for off in offsets:
+        label = f"UTC{off:+d}"
+        row.append(InlineKeyboardButton(label, callback_data=f"tzo:{off}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="back:menu")])
-    return InlineKeyboardMarkup(rows)
-
-
-def tz_page_keyboard(region: str, page: int) -> InlineKeyboardMarkup:
-    tz_list = [tz for tz in pytz.all_timezones if tz.startswith(region + "/") or tz == region]
-    total_pages = max(1, (len(tz_list) + PAGE_SIZE - 1) // PAGE_SIZE)
-    page = max(0, min(page, total_pages - 1))
-    start = page * PAGE_SIZE
-    chunk = tz_list[start:start + PAGE_SIZE]
-
-    rows = [[InlineKeyboardButton(tz, callback_data=f"tz:{region}:{tz}")] for tz in chunk]
-
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("◀️ Назад", callback_data=f"tz:{region}:__prev__:{page-1}"))
-    if page < total_pages - 1:
-        nav.append(InlineKeyboardButton("Вперёд ▶️", callback_data=f"tz:{region}:__next__:{page+1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton("🌍 Выбрать регион", callback_data="tzr:pick")])
-    rows.append([InlineKeyboardButton("◀️ В меню", callback_data="back:menu")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -288,8 +282,8 @@ async def reschedule_daily_job(app: Application, team_id: int):
     if not team or not team["reminder_time"]:
         return
     hhmm = parse_hhmm(team["reminder_time"])
-    tz = pytz.timezone(team["tz"])
-    days = parse_reminder_days(team["reminder_days"])  # tuple of ints 0..6
+    tzinfo = tz_from_str(team["tz"])
+    days = parse_reminder_days(team["reminder_days"])
 
     app.job_queue.run_daily(
         callback=daily_job_callback,
@@ -297,7 +291,7 @@ async def reschedule_daily_job(app: Application, team_id: int):
         days=days,
         name=job_name,
         data={"team_id": team_id},
-        tzinfo=tz,
+        tzinfo=tzinfo,
     )
 
 
@@ -311,8 +305,8 @@ async def start_standup(app: Application, team_id: int, manual: bool=False):
     team = conn.execute("SELECT id, name, tz FROM teams WHERE id=?", (team_id,)).fetchone()
     if not team:
         return
-    tz_name = team["tz"]
-    today = today_in_tz(tz_name).isoformat()
+    tz_str = team["tz"]
+    today = today_in_tz(tz_str).isoformat()
 
     existed = conn.execute("SELECT id FROM standups WHERE team_id=? AND date_iso=?", (team_id, today)).fetchone()
     if existed and not manual:
@@ -413,7 +407,6 @@ async def post_summary(ctx: ContextTypes.DEFAULT_TYPE):
 # ---------- HANDLERS (меню и команды) ----------
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # регистрируем пользователя
     conn = db()
     with conn:
         conn.execute("INSERT OR REPLACE INTO users (tg_id, name) VALUES (?, ?)", (update.effective_user.id, get_user_name(update)))
@@ -553,71 +546,43 @@ async def on_settime_hhmm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return S_SET_TIME_HHMM
     ctx.user_data["settime_hhmm"] = hhmm
 
-    # Переходим к выбору TZ
+    # Переходим к простому выбору UTC±N
     await update.effective_message.reply_text(
-        "Выберите регион часового пояса или введите таймзону вручную (например, Europe/Amsterdam):",
-        reply_markup=tz_region_keyboard(),
+        "Выбери смещение часового пояса (UTC±N):", reply_markup=tz_offset_keyboard()
     )
     return S_SET_TIME_TZ
 
 
-async def on_settime_tz(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Ручной ввод таймзоны; дальше — выбор расписания
-    tz_name = (update.effective_message.text or "").strip()
-    try:
-        pytz.timezone(tz_name)
-    except Exception:
-        await update.effective_message.reply_text(
-            "Неизвестный TZ. Пример: Europe/Amsterdam. Либо выберите регион на кнопках выше."
-        )
-        return S_SET_TIME_TZ
-    ctx.user_data["settime_tz"] = tz_name
-    await update.effective_message.reply_text(
-        "Выберите расписание запусков:", reply_markup=schedule_preset_keyboard()
-    )
-    return S_SET_SCHEDULE
-
-
-async def on_settime_tz_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def on_tz_offset_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     data = q.data
-
-    if data == "tzman":
-        await q.edit_message_text("Введите таймзону вручную, например: Europe/Amsterdam")
-        return S_SET_TIME_TZ
-
-    if data.startswith("tzr:"):
-        parts = data.split(":", 1)
-        region = parts[1]
-        if region == "pick":
-            await q.edit_message_text("Выберите регион:", reply_markup=tz_region_keyboard())
-            return S_SET_TIME_TZ
-        await q.edit_message_text(f"Регион: {region}. Выберите город:", reply_markup=tz_page_keyboard(region, 0))
-        return S_SET_TIME_TZ
-
-    if data.startswith("tz:"):
-        parts = data.split(":")
-        region = parts[1]
-        if parts[2] in ("__prev__", "__next__"):
-            page = int(parts[3])
-            await q.edit_message_text(
-                f"Регион: {region}. Выберите город:", reply_markup=tz_page_keyboard(region, page)
-            )
-            return S_SET_TIME_TZ
-        tz_name = ":".join(parts[2:])
-        try:
-            pytz.timezone(tz_name)
-        except Exception:
-            await q.edit_message_text("Что-то не так с выбранной таймзоной. Попробуйте ещё раз.", reply_markup=tz_region_keyboard())
-            return S_SET_TIME_TZ
+    if data.startswith("tzo:"):
+        off = int(data.split(":", 1)[1])
+        tz_name = f"UTC{off:+d}"
         ctx.user_data["settime_tz"] = tz_name
         await q.edit_message_text(
             f"Часовой пояс: {tz_name}. Выберите расписание:", reply_markup=schedule_preset_keyboard()
         )
         return S_SET_SCHEDULE
-
+    if data == "back:menu":
+        await show_menu(update, ctx)
+        return S_MENU
     return S_SET_TIME_TZ
+
+
+async def on_settime_tz_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Доп. возможность: пользователь ввёл вручную 'UTC+3' или 'Europe/Moscow'
+    tz_name = (update.effective_message.text or "").strip()
+    # Попробуем распарсить; если ок — дальше в расписание
+    try:
+        _ = tz_from_str(tz_name)
+    except Exception:
+        await update.effective_message.reply_text("Не понял таймзону. Используй формат UTC+3 или выбери кнопку.")
+        return S_SET_TIME_TZ
+    ctx.user_data["settime_tz"] = tz_name
+    await update.effective_message.reply_text("Выберите расписание запусков:", reply_markup=schedule_preset_keyboard())
+    return S_SET_SCHEDULE
 
 
 async def on_schedule_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -647,11 +612,9 @@ async def on_schedule_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "UPDATE teams SET reminder_time=?, tz=?, reminder_days=? WHERE id=?",
                 (hhmm, tz_name, days_json, team_id),
             )
-        # очистим временные данные ДО рескейдюла, чтобы в случае ошибки в job_queue у нас не осталось «висячего» состояния
         for k in ("settime_team_id","settime_hhmm","settime_tz","settime_days"):
             ctx.user_data.pop(k, None)
 
-        # пересоздаём джобу
         asyncio.create_task(reschedule_daily_job(ctx.application, team_id))
 
         return (f"Ок! Время дэйлика: {hhmm} ({tz_name}), дни: {days_to_label(days)}.", main_menu(uid))
@@ -672,7 +635,7 @@ async def on_schedule_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sel = set(ctx.user_data.get("settime_days", set()))
         if data == "sch:custom:start":
             if not sel:
-                sel = set(range(5))  # по умолчанию будни
+                sel = set(range(5))
             ctx.user_data["settime_days"] = sel
             await q.edit_message_text("Отметьте дни недели:", reply_markup=schedule_custom_keyboard(sel))
             return S_SET_SCHEDULE
@@ -761,6 +724,19 @@ async def on_text_flow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await show_menu(update, ctx)
         return S_MENU
 
+    # Ручной ввод TZ на шаге выбора TZ (поддержка UTC+N / Europe/Moscow)
+    if ctx.user_data.get("settime_hhmm") and "settime_tz" not in ctx.user_data:
+        # попытка воспринять сообщение как tz
+        tz_name = (update.effective_message.text or "").strip()
+        if tz_name:
+            try:
+                _ = tz_from_str(tz_name)
+                ctx.user_data["settime_tz"] = tz_name
+                await update.effective_message.reply_text("Выберите расписание запусков:", reply_markup=schedule_preset_keyboard())
+                return S_SET_SCHEDULE
+            except Exception:
+                pass
+
     # Ответы на дэйлик (ForceReply)
     msg = update.effective_message
     if msg and msg.reply_to_message and not msg.from_user.is_bot:
@@ -825,8 +801,8 @@ def build_app() -> Application:
             S_SET_TIME_TEAM: [CallbackQueryHandler(on_settime_team_choice)],
             S_SET_TIME_HHMM: [MessageHandler(filters.TEXT & (~filters.COMMAND), on_settime_hhmm)],
             S_SET_TIME_TZ: [
-                MessageHandler(filters.TEXT & (~filters.COMMAND), on_settime_tz),
-                CallbackQueryHandler(on_settime_tz_pick, pattern=r"^(tzr:|tz:|tzman)$"),
+                CallbackQueryHandler(on_tz_offset_pick, pattern=r"^(tzo:|back:menu)$"),
+                MessageHandler(filters.TEXT & (~filters.COMMAND), on_settime_tz_manual),
             ],
             S_SET_SCHEDULE: [CallbackQueryHandler(on_schedule_pick, pattern=r"^sch:")],
             S_STANDUP_TEAM: [CallbackQueryHandler(on_standup_team_choice)],
