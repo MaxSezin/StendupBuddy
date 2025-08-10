@@ -848,8 +848,8 @@ def build_app() -> Application:
             CommandHandler("health", cmd_health),
         ],
         states={
-            S_MENU: [CallbackQueryHandler(on_menu_click, pattern=r"^(m:|back:menu|back:teams|g:)")],
-            S_GROUP_SELECT: [CallbackQueryHandler(on_menu_click, pattern=r"^(g:|back:menu|m:teams)$")],
+            S_MENU: [CallbackQueryHandler(on_menu_click)],
+            S_GROUP_SELECT: [CallbackQueryHandler(on_menu_click)],
             S_GROUP_MENU: [CallbackQueryHandler(on_group_menu, pattern=r"^(gm:|back:group|back:teams|back:menu)$")],
             S_CREATE_TEAM_NAME: [
                 MessageHandler(filters.TEXT & (~filters.COMMAND), on_text_flow),
