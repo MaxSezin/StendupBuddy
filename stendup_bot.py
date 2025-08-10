@@ -850,7 +850,7 @@ def build_app() -> Application:
         states={
             S_MENU: [CallbackQueryHandler(on_menu_click)],
             S_GROUP_SELECT: [CallbackQueryHandler(on_menu_click)],
-            S_GROUP_MENU: [CallbackQueryHandler(on_group_menu, pattern=r"^(gm:|back:group|back:teams|back:menu)$")],
+            S_GROUP_MENU: [CallbackQueryHandler(on_group_menu)],
             S_CREATE_TEAM_NAME: [
                 MessageHandler(filters.TEXT & (~filters.COMMAND), on_text_flow),
                 CallbackQueryHandler(on_menu_click, pattern=r"^back:menu$"),
@@ -868,7 +868,7 @@ def build_app() -> Application:
                 MessageHandler(filters.TEXT & (~filters.COMMAND), on_settime_tz_manual),
             ],
             S_SET_SCHEDULE: [
-                CallbackQueryHandler(on_schedule_pick, pattern=r"^(sch:|back:group|back:schedule)$"),
+                CallbackQueryHandler(on_schedule_pick),
             ],
             S_REMOVE_MEMBER_SELECT: [
                 CallbackQueryHandler(on_remove_member, pattern=r"^(rm:|back:group)$")
