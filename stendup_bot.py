@@ -1,5 +1,5 @@
 # standupbuddy_bot.py
-# StandupBuddy — версия с простым выбором часового пояса (UTC±N)
+# StandupBuddy — версия с простым выбором часового пояса (UTC±N) и меню группы
 # python-telegram-bot==21.6, pytz
 #
 # Запуск:
@@ -39,18 +39,17 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 REMIND_AFTER_MIN = 10
 SUMMARY_AFTER_MIN = 30
-PAGE_SIZE = 10  # not used now, kept for compatibility
 
 # Conversation states
 (
     S_MENU,
     S_CREATE_TEAM_NAME,
     S_JOIN_CODE,
-    S_SET_TIME_TEAM,
+    S_GROUP_SELECT,
+    S_GROUP_MENU,
     S_SET_TIME_HHMM,
-    S_SET_TIME_TZ,   # here we now show UTC±N buttons
+    S_SET_TIME_TZ,   # UTC±N buttons
     S_SET_SCHEDULE,
-    S_STANDUP_TEAM,
 ) = range(8)
 
 # ---------- БАЗА ДАННЫХ ----------
@@ -127,10 +126,6 @@ def now_utc():
 
 
 def tz_from_str(tz_str: str):
-    """Возвращает tzinfo из строки. Поддерживает:
-    - 'UTC+3', 'UTC-2', 'UTC+0'
-    - классические зоны pytz типа 'Europe/Moscow' (на всякий случай для обратной совместимости).
-    """
     if tz_str and tz_str.upper().startswith("UTC"):
         sign = 1
         rest = tz_str[3:]
@@ -145,7 +140,6 @@ def tz_from_str(tz_str: str):
             return pytz.FixedOffset(sign * hours * 60)
         except Exception:
             pass
-    # fallback
     try:
         return pytz.timezone(tz_str)
     except Exception:
@@ -199,35 +193,39 @@ def days_to_label(days: tuple[int, ...]) -> str:
 def main_menu(uid: int) -> InlineKeyboardMarkup:
     conn = db()
     rows = conn.execute(
-        "SELECT t.id, t.managers_json FROM teams t JOIN team_members m ON m.team_id=t.id WHERE m.tg_id=?",
+        "SELECT t.id, t.name FROM teams t JOIN team_members m ON m.team_id=t.id WHERE m.tg_id=? ORDER BY t.id",
         (uid,),
     ).fetchall()
     has_teams = len(rows) > 0
-    manager_teams = [r for r in rows if uid in json.loads(r["managers_json"]) ]
 
     buttons = []
     buttons.append([InlineKeyboardButton("➕ Создать команду", callback_data="m:create")])
     buttons.append([InlineKeyboardButton("🔗 Вступить по коду", callback_data="m:join")])
     if has_teams:
-        buttons.insert(1, [InlineKeyboardButton("👥 Мои команды", callback_data="m:teams")])
-    if manager_teams:
-        buttons.append([InlineKeyboardButton("⏱ Настроить расписание", callback_data="m:settime")])
-        buttons.append([InlineKeyboardButton("▶️ Запустить дэйлик", callback_data="m:standup")])
+        team_buttons = [[InlineKeyboardButton(f"⚙️ {r['name']} (ID {r['id']})", callback_data=f"g:{r['id']}")] for r in rows]
+        buttons.append([InlineKeyboardButton("👥 Мои команды — выбрать", callback_data="m:teams")])
+        buttons.extend(team_buttons[:6])
     return InlineKeyboardMarkup(buttons)
 
 
-async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str = "Главное меню"):
-    if update.callback_query:
-        await update.callback_query.answer()
-        await update.callback_query.edit_message_text(text, reply_markup=main_menu(update.effective_user.id))
+def group_menu_keyboard(team_row, is_manager: bool) -> InlineKeyboardMarkup:
+    has_schedule = bool(team_row["reminder_time"])
+    buttons = []
+    if has_schedule:
+        buttons.append([InlineKeyboardButton("📄 Посмотреть расписание", callback_data=f"gm:view:{team_row['id']}")])
+        if is_manager:
+            buttons.append([InlineKeyboardButton("✏️ Редактировать расписание", callback_data=f"gm:edit:{team_row['id']}")])
+            buttons.append([InlineKeyboardButton("🗑 Удалить расписание", callback_data=f"gm:del:{team_row['id']}")])
     else:
-        await update.effective_message.reply_text(text, reply_markup=main_menu(update.effective_user.id))
+        if is_manager:
+            buttons.append([InlineKeyboardButton("➕ Создать расписание", callback_data=f"gm:edit:{team_row['id']}")])
+    buttons.append([InlineKeyboardButton("👥 Участники", callback_data=f"gm:members:{team_row['id']}")])
+    buttons.append([InlineKeyboardButton("◀️ К списку групп", callback_data="back:teams")])
+    buttons.append([InlineKeyboardButton("🏠 В меню", callback_data="back:menu")])
+    return InlineKeyboardMarkup(buttons)
 
-
-# ---------- SIMPLE UTC±N PICKER ----------
 
 def tz_offset_keyboard() -> InlineKeyboardMarkup:
-    # диапазон смещений от -12 до +14
     offsets = list(range(-12, 15))
     rows = []
     row = []
@@ -239,19 +237,17 @@ def tz_offset_keyboard() -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="back:menu")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="back:group")])
     return InlineKeyboardMarkup(rows)
 
-
-# ---------- SCHEDULE PICKER ----------
 
 def schedule_preset_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Каждый день", callback_data="sch:preset:everyday")],
-        [InlineKeyboardButton("🏢 Только будни (Пн–Пт)", callback_data="sch:preset:weekdays")],
-        [InlineKeyboardButton("🎉 Только выходные (Сб–Вс)", callback_data="sch:preset:weekends")],
-        [InlineKeyboardButton("🧩 Настроить дни…", callback_data="sch:custom:start")],
-        [InlineKeyboardButton("◀️ В меню", callback_data="back:menu")],
+        [InlineKeyboardButton("🏢 Будни (Пн–Пт)", callback_data="sch:preset:weekdays")],
+        [InlineKeyboardButton("🎉 Выходные (Сб–Вс)", callback_data="sch:preset:weekends")],
+        [InlineKeyboardButton("🧩 Кастомные дни…", callback_data="sch:custom:start")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="back:group")],
     ])
 
 
@@ -265,18 +261,20 @@ def schedule_custom_keyboard(selected: set[int]) -> InlineKeyboardMarkup:
         InlineKeyboardButton("Сохранить", callback_data="sch:custom:save"),
         InlineKeyboardButton("Сброс", callback_data="sch:custom:reset"),
     ])
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="sch:custom:back")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="back:schedule")])
     return InlineKeyboardMarkup(rows)
 
 
 # ---------- JOBS ----------
 
-async def reschedule_daily_job(app: Application, team_id: int):
+async def remove_daily_job(app: Application, team_id: int):
     job_name = f"daily_{team_id}"
-    current = app.job_queue.get_jobs_by_name(job_name)
-    for j in current:
+    for j in app.job_queue.get_jobs_by_name(job_name):
         j.schedule_removal()
 
+
+async def reschedule_daily_job(app: Application, team_id: int):
+    await remove_daily_job(app, team_id)
     conn = db()
     team = conn.execute("SELECT reminder_time, tz, reminder_days FROM teams WHERE id=?", (team_id,)).fetchone()
     if not team or not team["reminder_time"]:
@@ -284,12 +282,11 @@ async def reschedule_daily_job(app: Application, team_id: int):
     hhmm = parse_hhmm(team["reminder_time"])
     tzinfo = tz_from_str(team["tz"])
     days = parse_reminder_days(team["reminder_days"])
-
     app.job_queue.run_daily(
         callback=daily_job_callback,
         time=hhmm,
         days=days,
-        name=job_name,
+        name=f"daily_{team_id}",
         data={"team_id": team_id},
         tzinfo=tzinfo,
     )
@@ -307,15 +304,12 @@ async def start_standup(app: Application, team_id: int, manual: bool=False):
         return
     tz_str = team["tz"]
     today = today_in_tz(tz_str).isoformat()
-
     existed = conn.execute("SELECT id FROM standups WHERE team_id=? AND date_iso=?", (team_id, today)).fetchone()
     if existed and not manual:
         return
-
     members = [r["tg_id"] for r in conn.execute("SELECT tg_id FROM team_members WHERE team_id=?", (team_id,)).fetchall()]
     if not members:
         return
-
     with conn:
         cur = conn.execute(
             "INSERT INTO standups (team_id, date_iso, started_utc) VALUES (?, ?, ?)",
@@ -324,10 +318,9 @@ async def start_standup(app: Application, team_id: int, manual: bool=False):
         standup_id = cur.lastrowid
         for uid in members:
             conn.execute("INSERT INTO updates (standup_id, tg_id, answered) VALUES (?, ?, 0)", (standup_id, uid))
-
     text = (
         f"🕒 Дэйлик команды «{team['name']}»\n\n"
-        "Ответьте одним сообщением на этот запрос (реплаем):\n"
+        "Ответьте одним сообщением:\n"
         "— Что делал вчера?\n— Что планируешь сегодня?\n— Есть ли блокеры?"
     )
     for uid in members:
@@ -335,15 +328,8 @@ async def start_standup(app: Application, team_id: int, manual: bool=False):
             await app.bot.send_message(chat_id=uid, text=text, reply_markup=ForceReply(selective=True))
         except Exception:
             pass
-
-    remind_key = f"remind_{standup_id}"
-    summary_key = f"summary_{standup_id}"
-
-    app.job_queue.run_once(remind_unanswered, when=timedelta(minutes=REMIND_AFTER_MIN), name=remind_key, data={"standup_id": standup_id, "team_id": team_id})
-    app.job_queue.run_once(post_summary, when=timedelta(minutes=SUMMARY_AFTER_MIN), name=summary_key, data={"standup_id": standup_id, "team_id": team_id})
-
-    with conn:
-        conn.execute("UPDATE standups SET remind_job_key=?, summary_job_key=? WHERE id=?", (remind_key, summary_key, standup_id))
+    app.job_queue.run_once(remind_unanswered, when=timedelta(minutes=REMIND_AFTER_MIN), name=f"remind_{standup_id}", data={"standup_id": standup_id, "team_id": team_id})
+    app.job_queue.run_once(post_summary, when=timedelta(minutes=SUMMARY_AFTER_MIN), name=f"summary_{standup_id}", data={"standup_id": standup_id, "team_id": team_id})
 
 
 async def remind_unanswered(ctx: ContextTypes.DEFAULT_TYPE):
@@ -368,7 +354,6 @@ async def post_summary(ctx: ContextTypes.DEFAULT_TYPE):
     conn = db()
     team = conn.execute("SELECT name, managers_json FROM teams WHERE id=?", (team_id,)).fetchone()
     managers = json.loads(team["managers_json"]) if team else []
-
     members = conn.execute(
         """
         SELECT u.tg_id, u.name, COALESCE(upd.text, '') AS text, upd.answered AS answered
@@ -380,14 +365,12 @@ async def post_summary(ctx: ContextTypes.DEFAULT_TYPE):
         """,
         (standup_id, team_id),
     ).fetchall()
-
     lines = [f"🧾 Итоги дэйлика «{team['name']}»:"]
     for r in members:
         status = "✅" if r["answered"] else "❌"
         body = (r["text"] or "").strip() or "_нет ответа_"
         lines.append(f"{status} <b>{r['name']}</b>\n{body}")
     summary = "\n\n".join(lines)
-
     sent_to = set()
     for r in members:
         sent_to.add(r["tg_id"])
@@ -406,11 +389,19 @@ async def post_summary(ctx: ContextTypes.DEFAULT_TYPE):
 
 # ---------- HANDLERS (меню и команды) ----------
 
+async def show_main_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str | None = None):
+    msg = text or "Привет! Это StandupBuddy. Выбери действие или сразу открой группу:"
+    if update.callback_query:
+        await update.callback_query.edit_message_text(msg, reply_markup=main_menu(update.effective_user.id))
+    else:
+        await update.effective_message.reply_text(msg, reply_markup=main_menu(update.effective_user.id))
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     conn = db()
     with conn:
         conn.execute("INSERT OR REPLACE INTO users (tg_id, name) VALUES (?, ?)", (update.effective_user.id, get_user_name(update)))
-    await show_menu(update, ctx, "Привет! Это StandupBuddy. Выбирай действие:")
+    await show_main_menu(update, ctx)
     return S_MENU
 
 
@@ -423,10 +414,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    for k in ("await_create_team_name","await_join_code","settime_team_id","settime_hhmm","settime_tz","settime_days"):
+    for k in ("await_create_team_name","await_join_code","group_id","settime_hhmm","settime_tz","settime_days"):
         ctx.user_data.pop(k, None)
     await update.effective_message.reply_text("Окей, отменил. Возвращаю в меню.")
-    await show_menu(update, ctx)
+    await show_main_menu(update, ctx)
     return S_MENU
 
 
@@ -444,6 +435,19 @@ async def cmd_health(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return S_MENU
 
 
+def team_choice_keyboard(uid: int) -> InlineKeyboardMarkup:
+    conn = db()
+    rows = conn.execute(
+        "SELECT t.id, t.name FROM teams t JOIN team_members m ON m.team_id=t.id WHERE m.tg_id=? ORDER BY t.id",
+        (uid,),
+    ).fetchall()
+    if not rows:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 В меню", callback_data="back:menu")]])
+    buttons = [[InlineKeyboardButton(f"{r['name']} (ID {r['id']})", callback_data=f"g:{r['id']}")] for r in rows]
+    buttons.append([InlineKeyboardButton("🏠 В меню", callback_data="back:menu")])
+    return InlineKeyboardMarkup(buttons)
+
+
 async def on_menu_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -451,90 +455,105 @@ async def on_menu_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data == "m:create":
         ctx.user_data["await_create_team_name"] = True
-        await q.edit_message_text("Название новой команды? Напишите текстом.")
+        await q.edit_message_text("Название новой команды? Напишите текстом.\n\nНажмите /cancel, чтобы отменить.")
         return S_CREATE_TEAM_NAME
 
-    if data == "m:teams":
-        uid = update.effective_user.id
+    if data in ("m:teams", "back:teams"):
+        await q.edit_message_text("Выберите группу:", reply_markup=team_choice_keyboard(update.effective_user.id))
+        return S_GROUP_SELECT
+
+    if data.startswith("g:"):
+        team_id = int(data.split(":",1)[1])
         conn = db()
-        rows = conn.execute(
-            """
-            SELECT t.id, t.name, t.tz, t.reminder_time, t.reminder_days, t.managers_json
-            FROM teams t JOIN team_members m ON m.team_id=t.id
-            WHERE m.tg_id=? ORDER BY t.id
-            """,
-            (uid,),
-        ).fetchall()
-        if not rows:
-            await q.edit_message_text("Вы пока не в командах.", reply_markup=main_menu(uid))
-            return S_MENU
-        lines = []
-        for r in rows:
-            managers = json.loads(r["managers_json"]) if r["managers_json"] else []
-            is_mgr = "да" if uid in managers else "нет"
-            days_label = days_to_label(parse_reminder_days(r["reminder_days"])) if r["reminder_time"] else "—"
-            lines.append(
-                f"ID {r['id']}: {r['name']} | TZ {r['tz']} | время {r['reminder_time'] or '—'} | дни: {days_label} | менеджер: {is_mgr}"
-            )
-        await q.edit_message_text("Ваши команды:\n" + "\n".join(lines), reply_markup=main_menu(uid))
-        return S_MENU
+        team = conn.execute("SELECT id, name, tz, reminder_time, reminder_days, managers_json FROM teams WHERE id=?", (team_id,)).fetchone()
+        if not team:
+            await q.edit_message_text("Команда не найдена.", reply_markup=team_choice_keyboard(update.effective_user.id))
+            return S_GROUP_SELECT
+        ctx.user_data["group_id"] = team_id
+        is_mgr = update.effective_user.id in json.loads(team["managers_json"])
+        await q.edit_message_text(
+            f"Команда «{team['name']}» (ID {team_id})", reply_markup=group_menu_keyboard(team, is_mgr)
+        )
+        return S_GROUP_MENU
 
     if data == "m:join":
         ctx.user_data["await_join_code"] = True
-        await q.edit_message_text("Введи инвайт‑код:")
+        await q.edit_message_text("Введи инвайт‑код:\n\n/cancel — отмена")
         return S_JOIN_CODE
 
-    if data == "m:settime":
-        uid = update.effective_user.id
-        conn = db()
-        rows = conn.execute(
-            "SELECT id, name, managers_json FROM teams t JOIN team_members m ON m.team_id=t.id WHERE m.tg_id=?",
-            (uid,),
-        ).fetchall()
-        manager_teams = [r for r in rows if uid in json.loads(r["managers_json"]) ]
-        if not manager_teams:
-            await q.edit_message_text("Нет команд, где вы менеджер.", reply_markup=main_menu(uid))
-            return S_MENU
-        buttons = [[InlineKeyboardButton(f"{r['name']} (ID {r['id']})", callback_data=f"settime:{r['id']}") ] for r in manager_teams]
-        buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="back:menu")])
-        await q.edit_message_text("Выберите команду для настройки расписания:", reply_markup=InlineKeyboardMarkup(buttons))
-        return S_SET_TIME_TEAM
-
-    if data == "m:standup":
-        uid = update.effective_user.id
-        conn = db()
-        rows = conn.execute(
-            "SELECT id, name, managers_json FROM teams t JOIN team_members m ON m.team_id=t.id WHERE m.tg_id=?",
-            (uid,),
-        ).fetchall()
-        manager_teams = [r for r in rows if uid in json.loads(r["managers_json"]) ]
-        if not manager_teams:
-            await q.edit_message_text("Нет команд, где вы менеджер.", reply_markup=main_menu(uid))
-            return S_MENU
-        buttons = [[InlineKeyboardButton(f"▶️ {r['name']} (ID {r['id']})", callback_data=f"standup:{r['id']}") ] for r in manager_teams]
-        buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="back:menu")])
-        await q.edit_message_text("Выберите команду для запуска дэйлика сейчас:", reply_markup=InlineKeyboardMarkup(buttons))
-        return S_STANDUP_TEAM
-
-    if data.startswith("back:"):
-        await show_menu(update, ctx)
+    if data == "back:menu":
+        await show_main_menu(update, ctx)
         return S_MENU
 
     return S_MENU
 
 
-async def on_settime_team_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def on_group_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if q.data.startswith("settime:"):
-        team_id = int(q.data.split(":", 1)[1])
-        ctx.user_data["settime_team_id"] = team_id
-        await q.edit_message_text("Введите время в формате HH:MM (например, 10:00)")
-        return S_SET_TIME_HHMM
-    if q.data == "back:menu":
-        await show_menu(update, ctx)
+    data = q.data
+    team_id = ctx.user_data.get("group_id")
+    if not team_id:
+        await show_main_menu(update, ctx, "Группа не выбрана.")
         return S_MENU
-    return S_SET_TIME_TEAM
+
+    conn = db()
+    team = conn.execute("SELECT id, name, tz, reminder_time, reminder_days, managers_json FROM teams WHERE id=?", (team_id,)).fetchone()
+    if not team:
+        await q.edit_message_text("Команда не найдена.", reply_markup=team_choice_keyboard(update.effective_user.id))
+        return S_GROUP_SELECT
+    is_mgr = update.effective_user.id in json.loads(team["managers_json"])
+
+    if data == "back:group":
+        await q.edit_message_text(f"Команда «{team['name']}» (ID {team_id})", reply_markup=group_menu_keyboard(team, is_mgr))
+        return S_GROUP_MENU
+
+    if data == f"gm:view:{team_id}":
+        if team["reminder_time"]:
+            label = days_to_label(parse_reminder_days(team["reminder_days"]))
+            txt = f"✅ Расписание:\nВремя: {team['reminder_time']}\nTZ: {team['tz']}\nДни: {label}"
+        else:
+            txt = "Расписание ещё не создано."
+        await q.edit_message_text(txt, reply_markup=group_menu_keyboard(team, is_mgr))
+        return S_GROUP_MENU
+
+    if data == f"gm:edit:{team_id}":
+        if not is_mgr:
+            await q.edit_message_text("Только менеджер может менять расписание.", reply_markup=group_menu_keyboard(team, is_mgr))
+            return S_GROUP_MENU
+        ctx.user_data["settime_hhmm"] = None
+        await q.edit_message_text("Введите время в формате HH:MM (например, 10:00)", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back:group")]]))
+        return S_SET_TIME_HHMM
+
+    if data == f"gm:del:{team_id}":
+        if not is_mgr:
+            await q.edit_message_text("Только менеджер может удалять расписание.", reply_markup=group_menu_keyboard(team, is_mgr))
+            return S_GROUP_MENU
+        with conn:
+            conn.execute("UPDATE teams SET reminder_time=NULL, reminder_days=NULL WHERE id=?", (team_id,))
+        await remove_daily_job(ctx.application, team_id)
+        new_team = conn.execute("SELECT * FROM teams WHERE id=?", (team_id,)).fetchone()
+        await q.edit_message_text("Расписание удалено.", reply_markup=group_menu_keyboard(new_team, is_mgr))
+        return S_GROUP_MENU
+
+    if data == f"gm:members:{team_id}":
+        members = conn.execute(
+            "SELECT u.name FROM team_members tm JOIN users u ON u.tg_id=tm.tg_id WHERE tm.team_id=? ORDER BY u.name COLLATE NOCASE",
+            (team_id,)
+        ).fetchall()
+        names = [m["name"] for m in members] or ["— никого"]
+        await q.edit_message_text("👥 Участники:\n• " + "\n• ".join(names), reply_markup=group_menu_keyboard(team, is_mgr))
+        return S_GROUP_MENU
+
+    if data == "back:teams":
+        await q.edit_message_text("Выберите группу:", reply_markup=team_choice_keyboard(update.effective_user.id))
+        return S_GROUP_SELECT
+
+    if data == "back:menu":
+        await show_main_menu(update, ctx)
+        return S_MENU
+
+    return S_GROUP_MENU
 
 
 async def on_settime_hhmm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -542,11 +561,9 @@ async def on_settime_hhmm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         _ = parse_hhmm(hhmm)
     except Exception:
-        await update.effective_message.reply_text("Неверный формат. Пример: 09:30. Введите ещё раз:")
+        await update.effective_message.reply_text("Неверный формат. Пример: 09:30. Введите ещё раз:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back:group")]]))
         return S_SET_TIME_HHMM
     ctx.user_data["settime_hhmm"] = hhmm
-
-    # Переходим к простому выбору UTC±N
     await update.effective_message.reply_text(
         "Выбери смещение часового пояса (UTC±N):", reply_markup=tz_offset_keyboard()
     )
@@ -565,20 +582,16 @@ async def on_tz_offset_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Часовой пояс: {tz_name}. Выберите расписание:", reply_markup=schedule_preset_keyboard()
         )
         return S_SET_SCHEDULE
-    if data == "back:menu":
-        await show_menu(update, ctx)
-        return S_MENU
-    return S_SET_TIME_TZ
+    if data == "back:group":
+        return await on_group_menu(update, ctx)
 
 
 async def on_settime_tz_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Доп. возможность: пользователь ввёл вручную 'UTC+3' или 'Europe/Moscow'
     tz_name = (update.effective_message.text or "").strip()
-    # Попробуем распарсить; если ок — дальше в расписание
     try:
         _ = tz_from_str(tz_name)
     except Exception:
-        await update.effective_message.reply_text("Не понял таймзону. Используй формат UTC+3 или выбери кнопку.")
+        await update.effective_message.reply_text("Не понял таймзону. Используй формат UTC+3 или выбери кнопку.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="back:group")]]))
         return S_SET_TIME_TZ
     ctx.user_data["settime_tz"] = tz_name
     await update.effective_message.reply_text("Выберите расписание запусков:", reply_markup=schedule_preset_keyboard())
@@ -590,47 +603,40 @@ async def on_schedule_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     data = q.data
 
+    team_id = ctx.user_data.get("group_id")
+    if not team_id:
+        await show_main_menu(update, ctx, "Группа не выбрана.")
+        return S_MENU
+
     def finish_save(days: tuple[int, ...]):
-        team_id = ctx.user_data.get("settime_team_id")
         hhmm = ctx.user_data.get("settime_hhmm")
         tz_name = ctx.user_data.get("settime_tz")
         uid = update.effective_user.id
-
-        if team_id is None or not hhmm or not tz_name:
-            return ("Не хватает данных для сохранения. Начните заново.", main_menu(uid))
-
+        if not hhmm or not tz_name:
+            return "Не хватает данных. Начните заново.", None
         conn = db()
         team = conn.execute("SELECT name, managers_json FROM teams WHERE id=?", (team_id,)).fetchone()
         if not team:
-            return ("Команда не найдена.", main_menu(uid))
+            return "Команда не найдена.", None
         if uid not in json.loads(team["managers_json"]):
-            return ("Только менеджер может менять расписание.", main_menu(uid))
-
+            return "Только менеджер может менять расписание.", None
         days_json = json.dumps(list(days))
         with conn:
             conn.execute(
                 "UPDATE teams SET reminder_time=?, tz=?, reminder_days=? WHERE id=?",
                 (hhmm, tz_name, days_json, team_id),
             )
-        for k in ("settime_team_id","settime_hhmm","settime_tz","settime_days"):
+        for k in ("settime_hhmm","settime_tz","settime_days"):
             ctx.user_data.pop(k, None)
-
         asyncio.create_task(reschedule_daily_job(ctx.application, team_id))
-
-        return (f"Ок! Время дэйлика: {hhmm} ({tz_name}), дни: {days_to_label(days)}.", main_menu(uid))
+        return f"Ок! Время дэйлика: {hhmm} ({tz_name}), дни: {days_to_label(days)}.", None
 
     if data == "sch:preset:everyday":
-        msg, kb = finish_save(tuple(range(7)))
-        await q.edit_message_text(msg, reply_markup=kb)
-        return S_MENU
+        msg, _ = finish_save(tuple(range(7)))
     elif data == "sch:preset:weekdays":
-        msg, kb = finish_save(tuple(range(5)))
-        await q.edit_message_text(msg, reply_markup=kb)
-        return S_MENU
+        msg, _ = finish_save(tuple(range(5)))
     elif data == "sch:preset:weekends":
-        msg, kb = finish_save((5, 6))
-        await q.edit_message_text(msg, reply_markup=kb)
-        return S_MENU
+        msg, _ = finish_save((5, 6))
     elif data.startswith("sch:custom"):
         sel = set(ctx.user_data.get("settime_days", set()))
         if data == "sch:custom:start":
@@ -651,9 +657,7 @@ async def on_schedule_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if not days:
                 await q.edit_message_text("Нужно выбрать хотя бы один день.", reply_markup=schedule_custom_keyboard(set()))
                 return S_SET_SCHEDULE
-            msg, kb = finish_save(days)
-            await q.edit_message_text(msg, reply_markup=kb)
-            return S_MENU
+            msg, _ = finish_save(days)
         if data.startswith("sch:custom:toggle:"):
             d = int(data.rsplit(":", 1)[1])
             if d in sel:
@@ -667,25 +671,14 @@ async def on_schedule_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Выберите расписание:", reply_markup=schedule_preset_keyboard())
         return S_SET_SCHEDULE
 
-    return S_SET_SCHEDULE
-
-
-async def on_standup_team_choice(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if q.data.startswith("standup:"):
-        team_id = int(q.data.split(":", 1)[1])
-        await start_standup(ctx.application, team_id, manual=True)
-        await q.edit_message_text("Дэйлик запущен. Сообщения отправлены участникам.", reply_markup=main_menu(update.effective_user.id))
-        return S_MENU
-    if q.data == "back:menu":
-        await show_menu(update, ctx)
-        return S_MENU
-    return S_STANDUP_TEAM
+    conn = db()
+    team = conn.execute("SELECT id, name, tz, reminder_time, reminder_days, managers_json FROM teams WHERE id=?", (team_id,)).fetchone()
+    is_mgr = update.effective_user.id in json.loads(team["managers_json"])
+    await q.edit_message_text(msg, reply_markup=group_menu_keyboard(team, is_mgr))
+    return S_GROUP_MENU
 
 
 async def on_text_flow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # Создание команды (ввод имени)
     if ctx.user_data.get("await_create_team_name"):
         name = (update.effective_message.text or "").strip()
         code = gen_invite_code()
@@ -704,12 +697,11 @@ async def on_text_flow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"ID команды: {team_id}\n"
             f"Инвайт‑код: {code}\n"
             f"Поделитесь этим кодом или отправьте команду /join {code} коллегам, чтобы они присоединились.\n"
-            f"Теперь можно настроить расписание: ⏱ Настроить расписание",
+            f"Теперь выбери группу, чтобы перейти в её настройки.",
         )
-        await show_menu(update, ctx)
+        await show_main_menu(update, ctx, "Выберите группу из списка ниже:")
         return S_MENU
 
-    # Вступление по коду
     if ctx.user_data.get("await_join_code"):
         code = (update.effective_message.text or "").strip().upper()
         conn = db()
@@ -720,24 +712,10 @@ async def on_text_flow(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         with conn:
             conn.execute("INSERT OR IGNORE INTO team_members (team_id, tg_id) VALUES (?, ?)", (team["id"], update.effective_user.id))
         ctx.user_data.pop("await_join_code", None)
-        await update.effective_message.reply_text(f"Ок! Вы в команде «{team['name']}» (ID {team['id']}).")
-        await show_menu(update, ctx)
+        await update.effective_message.reply_text(f"Ок! Вы в команде «{team['name']}» (ID {team['id']}). Теперь выберите группу в меню.")
+        await show_main_menu(update, ctx)
         return S_MENU
 
-    # Ручной ввод TZ на шаге выбора TZ (поддержка UTC+N / Europe/Moscow)
-    if ctx.user_data.get("settime_hhmm") and "settime_tz" not in ctx.user_data:
-        # попытка воспринять сообщение как tz
-        tz_name = (update.effective_message.text or "").strip()
-        if tz_name:
-            try:
-                _ = tz_from_str(tz_name)
-                ctx.user_data["settime_tz"] = tz_name
-                await update.effective_message.reply_text("Выберите расписание запусков:", reply_markup=schedule_preset_keyboard())
-                return S_SET_SCHEDULE
-            except Exception:
-                pass
-
-    # Ответы на дэйлик (ForceReply)
     msg = update.effective_message
     if msg and msg.reply_to_message and not msg.from_user.is_bot:
         uid = update.effective_user.id
@@ -795,17 +773,22 @@ def build_app() -> Application:
             CommandHandler("health", cmd_health),
         ],
         states={
-            S_MENU: [CallbackQueryHandler(on_menu_click)],
+            S_MENU: [CallbackQueryHandler(on_menu_click, pattern=r"^(m:|back:menu|back:teams|g:)")],
+            S_GROUP_SELECT: [CallbackQueryHandler(on_menu_click, pattern=r"^(g:|back:menu|m:teams)$")],
+            S_GROUP_MENU: [CallbackQueryHandler(on_group_menu, pattern=r"^(gm:|back:group|back:teams|back:menu)$")],
             S_CREATE_TEAM_NAME: [MessageHandler(filters.TEXT & (~filters.COMMAND), on_text_flow)],
             S_JOIN_CODE: [MessageHandler(filters.TEXT & (~filters.COMMAND), on_text_flow)],
-            S_SET_TIME_TEAM: [CallbackQueryHandler(on_settime_team_choice)],
-            S_SET_TIME_HHMM: [MessageHandler(filters.TEXT & (~filters.COMMAND), on_settime_hhmm)],
+            S_SET_TIME_HHMM: [
+                MessageHandler(filters.TEXT & (~filters.COMMAND), on_settime_hhmm),
+                CallbackQueryHandler(on_group_menu, pattern=r"^back:group$"),
+            ],
             S_SET_TIME_TZ: [
-                CallbackQueryHandler(on_tz_offset_pick, pattern=r"^tzo:-?\d+$|^back:menu$"),
+                CallbackQueryHandler(on_tz_offset_pick, pattern=r"^tzo:-?\d+$|^back:group$"),
                 MessageHandler(filters.TEXT & (~filters.COMMAND), on_settime_tz_manual),
             ],
-            S_SET_SCHEDULE: [CallbackQueryHandler(on_schedule_pick, pattern=r"^sch:")],
-            S_STANDUP_TEAM: [CallbackQueryHandler(on_standup_team_choice)],
+            S_SET_SCHEDULE: [
+                CallbackQueryHandler(on_schedule_pick, pattern=r"^(sch:|back:group|back:schedule)$"),
+            ],
         },
         fallbacks=[
             CommandHandler("start", cmd_start),
@@ -816,10 +799,7 @@ def build_app() -> Application:
     )
 
     app.add_handler(conv)
-
-    # fallback для ответов на ForceReply и ручного ввода
     app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_text_flow))
-
     app.add_error_handler(on_error)
 
     return app
