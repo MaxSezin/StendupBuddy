@@ -148,15 +148,32 @@ def get_user_name(u: Update):
 # ---------- UI ----------
 
 def main_menu(uid: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("➕ Создать команду", callback_data="m:create")],
-            [InlineKeyboardButton("👥 Мои команды", callback_data="m:teams")],
-            [InlineKeyboardButton("🔗 Вступить по коду", callback_data="m:join")],
-            [InlineKeyboardButton("⏰ Назначить время", callback_data="m:settime")],
-            [InlineKeyboardButton("▶️ Запустить дэйлик", callback_data="m:standup")],
-        ]
-    )
+    """Показываем только релевантные кнопки.
+    Логика:
+    — Если пользователь ни в одной команде: только «Создать» и «Вступить».
+    — Если есть команды, но нет прав менеджера: «Мои команды» и «Вступить».
+    — Если есть команды, где он менеджер: добавляем «Назначить время» и «Запустить дэйлик».
+    """
+    conn = db()
+    rows = conn.execute(
+        "SELECT t.id, t.managers_json FROM teams t JOIN team_members m ON m.team_id=t.id WHERE m.tg_id=?",
+        (uid,),
+    ).fetchall()
+    has_teams = len(rows) > 0
+    manager_teams = [r for r in rows if uid in json.loads(r["managers_json"]) ]
+
+    buttons = []
+    # Базовые CTA
+    buttons.append([InlineKeyboardButton("➕ Создать команду", callback_data="m:create")])
+    buttons.append([InlineKeyboardButton("🔗 Вступить по коду", callback_data="m:join")])
+
+    if has_teams:
+        buttons.insert(1, [InlineKeyboardButton("👥 Мои команды", callback_data="m:teams")])
+    if manager_teams:
+        buttons.append([InlineKeyboardButton("⏰ Назначить время", callback_data="m:settime")])
+        buttons.append([InlineKeyboardButton("▶️ Запустить дэйлик", callback_data="m:standup")])
+
+    return InlineKeyboardMarkup(buttons)
 
 
 async def show_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str = "Главное меню"):
@@ -321,6 +338,8 @@ async def on_menu_click(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = q.data
 
     if data == "m:create":
+        # BUGFIX: ставим флаг ожидания имени, иначе on_text_flow не сработает
+        ctx.user_data["await_create_team_name"] = True
         await q.edit_message_text("Название новой команды? Напишите текстом.")
         return S_CREATE_TEAM_NAME
 
