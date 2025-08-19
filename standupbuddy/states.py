@@ -1,0 +1,13 @@
+(
+    S_MENU,
+    S_CREATE_TEAM_NAME,
+    S_JOIN_CODE,
+    S_GROUP_SELECT,
+    S_GROUP_MENU,
+    S_SET_TIME_HHMM,
+    S_SET_TIME_TZ,
+    S_SET_SCHEDULE,
+    S_REMOVE_MEMBER_SELECT,
+) = range(9)
+
+
