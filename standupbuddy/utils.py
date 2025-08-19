@@ -72,11 +72,11 @@ def parse_reminder_days(raw: str | None):
 
 def days_to_label(days):
     days = sorted(set(int(d) for d in days))
-    if tuple(days) == tuple(range(7)):
+    if len(days) == 7 and all(d in days for d in range(7)):
         return "каждый день"
-    if tuple(days) == tuple(range(5)):
+    if len(days) == 5 and all(d in days for d in range(5)):
         return "по будням"
-    if tuple(days) == (5, 6):
+    if len(days) == 2 and 5 in days and 6 in days:
         return "по выходным"
     names = ["Пн","Вт","Ср","Чт","Пт","Сб","Вс"]
     return ", ".join(names[d] for d in days)

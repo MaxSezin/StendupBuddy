@@ -96,12 +96,18 @@ async def post_summary(ctx: ContextTypes.DEFAULT_TYPE):
         """,
         (standup_id, team_id),
     ).fetchall()
-    lines = [f"🧾 Итоги дэйлика «{team['name']}»: "]
+    lines = [f"🧾 Итоги дэйлика «{team['name']}»:"]
     for r in members:
-        status = "✅" if r["answered"] else "❌"
-        body = (r["text"] or "").strip() or "_нет ответа_"
+        if r["answered"]:
+            status = "✅"
+            body = (r["text"] or "").strip() or "_пустой ответ_"
+        else:
+            status = "❌"
+            body = "— _не ответил_"
         lines.append(f"{status} <b>{r['name']}</b>\n{body}")
     summary = "\n\n".join(lines)
+    
+    # Send to all members
     sent_to = set()
     for r in members:
         sent_to.add(r["tg_id"])
@@ -109,9 +115,9 @@ async def post_summary(ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.application.bot.send_message(chat_id=r["tg_id"], text=summary, parse_mode=ParseMode.HTML)
         except Exception:
             pass
+    
+    # Send to managers (including those who are also members)
     for mid in managers:
-        if mid in sent_to:
-            continue
         try:
             await ctx.application.bot.send_message(chat_id=mid, text=summary, parse_mode=ParseMode.HTML)
         except Exception:

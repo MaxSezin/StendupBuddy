@@ -125,6 +125,7 @@ async def on_group_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == f"gm:view:{team_id}":
         if team["reminder_time"]:
             label = days_to_label(parse_reminder_days(team["reminder_days"]))
+            print(f"DEBUG: Viewing schedule - raw_days: {team['reminder_days']}, parsed: {parse_reminder_days(team['reminder_days'])}, label: {label}")
             txt = f"✅ Расписание:\nВремя: {team['reminder_time']}\nTZ: {team['tz']}\nДни: {label}"
         else:
             txt = "Расписание ещё не создано."
@@ -271,6 +272,7 @@ async def on_schedule_pick(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if uid not in json.loads(team["managers_json"]):
             return "Только менеджер может менять расписание."
         days_json = json.dumps(list(days))
+        print(f"DEBUG: Saving schedule - days: {days}, days_json: {days_json}, label: {days_to_label(days)}")
         with conn:
             conn.execute("UPDATE teams SET reminder_time=?, tz=?, reminder_days=? WHERE id=?", (hhmm, tz_name, days_json, team_id))
         for k in ("settime_hhmm","settime_tz","settime_days"):
