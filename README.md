@@ -108,3 +108,9 @@ WantedBy=multi-user.target
 - No messages received: verify `BOT_TOKEN` and that you are chatting with the correct bot
 - Jobs not firing: check `/health` output; on restart, jobs are restored from DB for teams with schedules
 
+#### Railway-specific issues:
+- **"Conflict: terminated by other getUpdates request"**: This happens when multiple bot instances run simultaneously during deployment. The bot now waits 30 seconds and retries automatically.
+- **Deployment fails**: Check Railway logs for Python version compatibility or missing dependencies
+- **Bot not responding**: Verify `BOT_TOKEN` is set correctly in Railway environment variables
+- **Health check fails**: The bot runs a web server on the `PORT` environment variable for health checks
+
